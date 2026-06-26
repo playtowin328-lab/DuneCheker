@@ -40,6 +40,23 @@ dp = Dispatcher()
 job_sem = asyncio.Semaphore(settings.job_concurrency)
 last_job_start: dict[int, float] = {}
 
+STATUS_LABELS = {
+    'queued': 'ожидает',
+    'running': 'выполняется',
+    'done': 'готово',
+    'error': 'ошибка',
+}
+TOKEN_LABELS = {
+    'all': 'все токены',
+    'native': 'нативный баланс',
+    'stables': 'стейблкоины',
+}
+FILTER_LABELS = {
+    'all': 'все кошельки',
+    'positive': 'только с балансом',
+    'min_usd': 'выше суммы в USD',
+}
+
 
 class CheckFlow(StatesGroup):
     waiting_addresses = State()
@@ -84,7 +101,7 @@ async def deny_if_needed(event: Message | CallbackQuery) -> bool:
     user_id = event.from_user.id
     if await allowed(user_id):
         return False
-    text = 'Access denied. Ask the owner to add your Telegram ID to OWNER_USER_ID or ALLOWED_USER_IDS.'
+    text = 'Доступ закрыт. Попроси владельца добавить твой Telegram ID в OWNER_USER_ID или ALLOWED_USER_IDS.'
     if isinstance(event, Message):
         await event.answer(text)
     else:
@@ -115,36 +132,41 @@ async def is_configured() -> bool:
 
 def mask_secret(value: str) -> str:
     if not value:
-        return 'not set'
+        return 'не задан'
     if len(value) <= 10:
         return value[:2] + '****'
     return f'{value[:6]}******{value[-4:]}'
+
+
+def label(mapping: dict[str, str], value: object) -> str:
+    raw = str(value or '')
+    return mapping.get(raw, raw or 'не задано')
 
 
 async def admin_text(refresh_dune: bool = False) -> str:
     owner = await get_owner_id()
     key = await dune_api_key()
     qid = await dune_query_id()
-    status = 'not configured'
-    credits = 'unknown'
+    status = 'не настроен'
+    credits = 'неизвестно'
     if key and refresh_dune:
         result = await DuneClient(key, settings.dune_timeout_seconds, settings.dune_poll_seconds).api_status()
-        status = 'online' if result.get('ok') else 'error'
-        credits = str(result.get('credits') if result.get('credits') is not None else result.get('details') or 'unknown')
+        status = 'онлайн' if result.get('ok') else 'ошибка'
+        credits = str(result.get('credits') if result.get('credits') is not None else result.get('details') or 'неизвестно')
     elif key:
-        status = 'configured'
+        status = 'настроен'
     return (
-        '<b>Admin panel</b>\n\n'
-        f'Dune API status: <code>{status}</code>\n'
-        f'Credits / limits: <code>{credits}</code>\n'
-        f'Current Query ID: <code>{qid or "not set"}</code>\n'
-        f'Bot owner: <code>{owner or "not set"}</code>\n'
-        f'Storage: <code>{storage.backend}</code>\n'
+        '<b>Админ-панель</b>\n\n'
+        f'Статус Dune API: <code>{status}</code>\n'
+        f'Credits / лимиты: <code>{credits}</code>\n'
+        f'Текущий Query ID: <code>{qid or "не задан"}</code>\n'
+        f'Владелец бота: <code>{owner or "не задан"}</code>\n'
+        f'Хранилище: <code>{storage.backend}</code>\n'
         f'Dune API key: <code>{mask_secret(key)}</code>\n'
-        f'Address limit: <code>{await max_limit()}</code>\n'
-        f'Job concurrency: <code>{settings.job_concurrency}</code>\n'
-        f'Batch size: <code>{settings.dune_batch_size}</code>\n'
-        f'Retries per batch: <code>{settings.dune_max_retries}</code>'
+        f'Лимит адресов: <code>{await max_limit()}</code>\n'
+        f'Параллельных задач: <code>{settings.job_concurrency}</code>\n'
+        f'Размер батча: <code>{settings.dune_batch_size}</code>\n'
+        f'Повторов на батч: <code>{settings.dune_max_retries}</code>'
     )
 
 
@@ -172,9 +194,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await message.answer(
-        '<b>Dune Wallet Checker v3 Pro</b>\n\n'
-        'Upload TXT, CSV or XLSX with public EVM addresses. The bot removes duplicates, validates addresses, runs Dune, and returns an Excel report.\n\n'
-        'Do not send seed phrases, private keys, passwords or exchange trading keys.',
+        '<b>Dune Проверка кошельков v3 Pro</b>\n\n'
+        'Загрузи TXT, CSV или XLSX с публичными EVM-адресами. Бот удалит дубли, проверит адреса, запустит Dune и вернёт Excel-отчёт.\n\n'
+        'Не отправляй seed-фразы, private key, пароли и биржевые ключи с торговыми правами.',
         reply_markup=main_menu(await is_configured()),
         parse_mode=ParseMode.HTML,
     )
@@ -183,10 +205,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 @dp.message(Command('help'))
 async def cmd_help(message: Message) -> None:
     await message.answer(
-        '<b>Commands</b>\n\n'
-        '/start - menu\n'
-        '/help - help\n\n'
-        'Flow: Admin panel -> Dune API key -> Query ID -> upload addresses -> chains -> mode -> Excel.',
+        '<b>Команды</b>\n\n'
+        '/start - меню\n'
+        '/help - помощь\n\n'
+        'Сценарий: админ-панель -> Dune API key -> Query ID -> загрузка адресов -> сети -> режим -> Excel.',
         parse_mode=ParseMode.HTML,
     )
 
@@ -194,7 +216,7 @@ async def cmd_help(message: Message) -> None:
 @dp.callback_query(F.data == 'menu')
 async def menu(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await call.message.edit_text('<b>Main menu</b>', reply_markup=main_menu(await is_configured()), parse_mode=ParseMode.HTML)
+    await call.message.edit_text('<b>Главное меню</b>', reply_markup=main_menu(await is_configured()), parse_mode=ParseMode.HTML)
     await call.answer()
 
 
@@ -210,12 +232,12 @@ async def cb_admin(call: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data == 'guide')
 async def cb_guide(call: CallbackQuery) -> None:
     await call.message.edit_text(
-        '<b>Railway / VPS deploy</b>\n\n'
-        '1. Push this repository to GitHub.\n'
-        '2. In Railway create a new project from the GitHub repo.\n'
-        '3. Add PostgreSQL and set BOT_TOKEN, OWNER_USER_ID, MAX_ADDRESSES_PER_JOB.\n'
-        '4. Open sql/dune_wallet_balances.sql in Dune, save it as a query, then put its Query ID into the bot admin panel.\n'
-        '5. Restart the Railway service and open /start in Telegram.',
+        '<b>Деплой Railway / VPS</b>\n\n'
+        '1. Запушь этот репозиторий на GitHub.\n'
+        '2. В Railway создай проект из GitHub-репозитория.\n'
+        '3. Добавь PostgreSQL и переменные BOT_TOKEN, OWNER_USER_ID, MAX_ADDRESSES_PER_JOB.\n'
+        '4. Открой sql/dune_wallet_balances.sql в Dune, сохрани как Query и вставь Query ID в админ-панель бота.\n'
+        '5. Перезапусти Railway-сервис и открой /start в Telegram.',
         reply_markup=main_menu(await is_configured()),
         parse_mode=ParseMode.HTML,
     )
@@ -225,12 +247,12 @@ async def cb_guide(call: CallbackQuery) -> None:
 @dp.callback_query(F.data == 'security')
 async def cb_security(call: CallbackQuery) -> None:
     await call.message.edit_text(
-        '<b>Security</b>\n\n'
-        '- The bot accepts only public wallet addresses.\n'
-        '- API keys are displayed only as a mask.\n'
-        '- Messages with Dune keys are deleted when Telegram allows it.\n'
-        '- Access is limited to the owner and allowed users.\n'
-        '- Address limits and a short anti-spam cooldown protect the queue.',
+        '<b>Безопасность</b>\n\n'
+        '- Бот принимает только публичные адреса кошельков.\n'
+        '- API-ключи показываются только маской.\n'
+        '- Сообщения с Dune key удаляются, если Telegram разрешает это сделать.\n'
+        '- Доступ ограничен владельцем и разрешёнными пользователями.\n'
+        '- Лимит адресов и короткий антиспам защищают очередь.',
         reply_markup=main_menu(await is_configured()),
         parse_mode=ParseMode.HTML,
     )
@@ -240,7 +262,7 @@ async def cb_security(call: CallbackQuery) -> None:
 @dp.callback_query(F.data == 'set:dune_key')
 async def cb_set_dune_key(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SettingsFlow.waiting_dune_key)
-    await call.message.edit_text('Send Dune API key in one message. I will try to delete that message after saving.', reply_markup=back_keyboard())
+    await call.message.edit_text('Отправь Dune API key одним сообщением. После сохранения я попробую удалить сообщение с ключом.', reply_markup=back_keyboard())
     await call.answer()
 
 
@@ -250,7 +272,7 @@ async def receive_dune_key(message: Message, state: FSMContext) -> None:
         return
     key = (message.text or '').strip()
     if len(key) < 20:
-        await message.answer('The key looks too short. Check it and send again.')
+        await message.answer('Ключ выглядит слишком коротким. Проверь его и отправь ещё раз.')
         return
     await storage.set('dune_api_key', key)
     await state.clear()
@@ -258,13 +280,13 @@ async def receive_dune_key(message: Message, state: FSMContext) -> None:
         await message.delete()
     except Exception:
         pass
-    await message.answer('Dune API key saved. It will be shown only as a mask.', reply_markup=settings_keyboard())
+    await message.answer('Dune API key сохранён. В интерфейсе он будет показываться только маской.', reply_markup=settings_keyboard())
 
 
 @dp.callback_query(F.data == 'set:query_id')
 async def cb_set_query_id(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SettingsFlow.waiting_query_id)
-    await call.message.edit_text('Send Dune Query ID as a number. Example: <code>1234567</code>', reply_markup=back_keyboard(), parse_mode=ParseMode.HTML)
+    await call.message.edit_text('Отправь Dune Query ID числом. Пример: <code>1234567</code>', reply_markup=back_keyboard(), parse_mode=ParseMode.HTML)
     await call.answer()
 
 
@@ -274,17 +296,17 @@ async def receive_query_id(message: Message, state: FSMContext) -> None:
         return
     value = (message.text or '').strip()
     if not value.isdigit():
-        await message.answer('Query ID must be a number.')
+        await message.answer('Query ID должен быть числом.')
         return
     await storage.set('dune_query_id', value)
     await state.clear()
-    await message.answer(f'Query ID saved: <code>{value}</code>', reply_markup=settings_keyboard(), parse_mode=ParseMode.HTML)
+    await message.answer(f'Query ID сохранён: <code>{value}</code>', reply_markup=settings_keyboard(), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == 'set:max_limit')
 async def cb_set_max_limit(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SettingsFlow.waiting_max_limit)
-    await call.message.edit_text('Send address limit per job. Recommended: 500-3000. Maximum: 10000.', reply_markup=back_keyboard())
+    await call.message.edit_text('Отправь лимит адресов на одну задачу. Рекомендую 500-3000. Максимум: 10000.', reply_markup=back_keyboard())
     await call.answer()
 
 
@@ -294,24 +316,24 @@ async def receive_max_limit(message: Message, state: FSMContext) -> None:
         return
     value = (message.text or '').strip()
     if not value.isdigit() or not (1 <= int(value) <= 10000):
-        await message.answer('Enter a number from 1 to 10000.')
+        await message.answer('Введи число от 1 до 10000.')
         return
     await storage.set('max_addresses_per_job', int(value))
     await state.clear()
-    await message.answer(f'Limit saved: <code>{value}</code>', reply_markup=settings_keyboard(), parse_mode=ParseMode.HTML)
+    await message.answer(f'Лимит сохранён: <code>{value}</code>', reply_markup=settings_keyboard(), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == 'clear:dune_key')
 async def cb_clear_dune_key(call: CallbackQuery) -> None:
     await storage.set('dune_api_key', '')
-    await call.message.edit_text('Dune API key removed.', reply_markup=settings_keyboard())
+    await call.message.edit_text('Dune API key удалён.', reply_markup=settings_keyboard())
     await call.answer()
 
 
 @dp.callback_query(F.data == 'settings:reset')
 async def cb_reset_settings(call: CallbackQuery) -> None:
     await storage.delete_many(['dune_api_key', 'dune_query_id', 'max_addresses_per_job'])
-    await call.message.edit_text('Runtime settings reset. OWNER_USER_ID from environment is kept.', reply_markup=admin_keyboard())
+    await call.message.edit_text('Настройки сброшены. OWNER_USER_ID из переменных окружения сохранён.', reply_markup=admin_keyboard())
     await call.answer()
 
 
@@ -320,27 +342,27 @@ async def cb_test_dune(call: CallbackQuery) -> None:
     key = await dune_api_key()
     qid = await dune_query_id()
     if not key or not qid:
-        await call.answer('Set Dune API key and Query ID first', show_alert=True)
+        await call.answer('Сначала задай Dune API key и Query ID', show_alert=True)
         return
-    await call.message.edit_text('Running a short Dune test with a zero address...', parse_mode=ParseMode.HTML)
+    await call.message.edit_text('Запускаю короткий тест Dune с нулевым адресом...', parse_mode=ParseMode.HTML)
     try:
         client = DuneClient(key, timeout_seconds=settings.dune_timeout_seconds, poll_seconds=settings.dune_poll_seconds)
         await client.run_wallet_check(qid, ['0x0000000000000000000000000000000000000000'], ['ethereum'], 'native')
-        await call.message.answer('Dune API key and Query ID work.', reply_markup=settings_keyboard())
+        await call.message.answer('Dune API key и Query ID работают.', reply_markup=settings_keyboard())
     except Exception as e:
-        await call.message.answer(f'Test failed:\n<code>{str(e)[:1500]}</code>', reply_markup=settings_keyboard(), parse_mode=ParseMode.HTML)
+        await call.message.answer(f'Тест не прошёл:\n<code>{str(e)[:1500]}</code>', reply_markup=settings_keyboard(), parse_mode=ParseMode.HTML)
     await call.answer()
 
 
 @dp.callback_query(F.data == 'check:start')
 async def cb_check_start(call: CallbackQuery, state: FSMContext) -> None:
     if not await is_configured():
-        await call.answer('Set Dune API key and Query ID first', show_alert=True)
+        await call.answer('Сначала задай Dune API key и Query ID', show_alert=True)
         return
     await state.set_state(CheckFlow.waiting_addresses)
     await call.message.edit_text(
-        '<b>Upload addresses</b>\n\n'
-        'Send addresses as text or upload TXT, CSV, XLSX. I will detect the address column, remove duplicates, and validate EVM addresses.',
+        '<b>Загрузка адресов</b>\n\n'
+        'Отправь адреса текстом или загрузи TXT, CSV, XLSX. Я найду колонку с адресами, удалю дубли и проверю EVM-адреса.',
         parse_mode=ParseMode.HTML,
     )
     await call.answer()
@@ -354,7 +376,7 @@ async def receive_addresses(message: Message, state: FSMContext) -> None:
         if message.document:
             suffix = Path(message.document.file_name or 'addresses.txt').suffix.lower()
             if suffix not in {'.txt', '.log', '.csv', '.xlsx', '.xls'}:
-                await message.answer('Send TXT, CSV or XLSX file.')
+                await message.answer('Отправь файл TXT, CSV или XLSX.')
                 return
             with tempfile.TemporaryDirectory() as tmp:
                 file_path = Path(tmp) / (message.document.file_name or 'addresses.txt')
@@ -363,16 +385,16 @@ async def receive_addresses(message: Message, state: FSMContext) -> None:
         else:
             extraction = extract_addresses(message.text or '')
     except Exception as e:
-        await message.answer(f'Could not read file: <code>{str(e)[:1000]}</code>', parse_mode=ParseMode.HTML)
+        await message.answer(f'Не смог прочитать файл: <code>{str(e)[:1000]}</code>', parse_mode=ParseMode.HTML)
         return
 
     addresses = extraction.addresses
     if not addresses:
-        await message.answer('No valid addresses found. Expected format: <code>0x</code> + 40 hex characters.', parse_mode=ParseMode.HTML)
+        await message.answer('Валидные адреса не найдены. Нужен формат: <code>0x</code> + 40 hex-символов.', parse_mode=ParseMode.HTML)
         return
     limit = await max_limit()
     if len(addresses) > limit:
-        await message.answer(f'Found {len(addresses)} addresses, current limit is {limit}. Keeping first {limit}.')
+        await message.answer(f'Найдено {len(addresses)} адресов, текущий лимит: {limit}. Оставляю первые {limit}.')
         addresses = addresses[:limit]
 
     await state.update_data(
@@ -390,9 +412,9 @@ async def receive_addresses(message: Message, state: FSMContext) -> None:
     if extraction.columns and len(extraction.columns) > 1:
         await state.set_state(CheckFlow.selecting_column)
         await message.answer(
-            f'Found {len(addresses)} addresses. Auto-selected column: <b>{extraction.selected_column}</b>.\n'
-            f'Duplicates removed: <b>{extraction.duplicates_removed}</b>. Invalid-like values: <b>{len(extraction.invalid_addresses)}</b>.\n\n'
-            'Choose another column if needed:',
+            f'Найдено адресов: <b>{len(addresses)}</b>. Автоматически выбрана колонка: <b>{extraction.selected_column}</b>.\n'
+            f'Удалено дублей: <b>{extraction.duplicates_removed}</b>. Похожих на невалидные адреса: <b>{len(extraction.invalid_addresses)}</b>.\n\n'
+            'Если нужно, выбери другую колонку:',
             reply_markup=column_keyboard(extraction.columns, extraction.selected_column),
             parse_mode=ParseMode.HTML,
         )
@@ -400,10 +422,10 @@ async def receive_addresses(message: Message, state: FSMContext) -> None:
 
     await state.set_state(CheckFlow.selecting_chains)
     await message.answer(
-        f'Found addresses: <b>{len(addresses)}</b>\n'
-        f'Duplicates removed: <b>{extraction.duplicates_removed}</b>\n'
-        f'Invalid-like values: <b>{len(extraction.invalid_addresses)}</b>\n\n'
-        'Choose chains:',
+        f'Найдено адресов: <b>{len(addresses)}</b>\n'
+        f'Удалено дублей: <b>{extraction.duplicates_removed}</b>\n'
+        f'Похожих на невалидные адреса: <b>{len(extraction.invalid_addresses)}</b>\n\n'
+        'Выбери сети:',
         reply_markup=chains_keyboard({'ethereum', 'base', 'arbitrum'}),
         parse_mode=ParseMode.HTML,
     )
@@ -416,7 +438,7 @@ async def cb_column(call: CallbackQuery, state: FSMContext) -> None:
     columns = data.get('columns', {})
     if action == 'done':
         await state.set_state(CheckFlow.selecting_chains)
-        await call.message.edit_text('Choose chains:', reply_markup=chains_keyboard(set(data.get('selected_chains', {'ethereum'}))))
+        await call.message.edit_text('Выбери сети:', reply_markup=chains_keyboard(set(data.get('selected_chains', {'ethereum'}))))
         await call.answer()
         return
     names = list(columns)
@@ -448,10 +470,10 @@ async def cb_chains_done(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     selected = set(data.get('selected_chains', set()))
     if not selected:
-        await call.answer('Choose at least one chain', show_alert=True)
+        await call.answer('Выбери хотя бы одну сеть', show_alert=True)
         return
     await state.set_state(CheckFlow.selecting_token)
-    await call.message.edit_text('Choose token mode:', reply_markup=token_keyboard(data.get('token_filter', 'all')))
+    await call.message.edit_text('Выбери режим токенов:', reply_markup=token_keyboard(data.get('token_filter', 'all')))
     await call.answer()
 
 
@@ -461,7 +483,7 @@ async def cb_token(call: CallbackQuery, state: FSMContext) -> None:
     if action == 'done':
         data = await state.get_data()
         await state.set_state(CheckFlow.selecting_filter)
-        await call.message.edit_text('Choose result filter:', reply_markup=result_filter_keyboard(data.get('result_filter', 'all')))
+        await call.message.edit_text('Выбери фильтр результата:', reply_markup=result_filter_keyboard(data.get('result_filter', 'all')))
         await call.answer()
         return
     await state.update_data(token_filter=action)
@@ -476,7 +498,7 @@ async def cb_filter(call: CallbackQuery, state: FSMContext) -> None:
         data = await state.get_data()
         if data.get('result_filter') == 'min_usd':
             await state.set_state(CheckFlow.waiting_min_usd)
-            await call.message.edit_text('Send minimum USD value. Example: <code>10</code>', parse_mode=ParseMode.HTML)
+            await call.message.edit_text('Отправь минимальную сумму в USD. Пример: <code>10</code>', parse_mode=ParseMode.HTML)
             await call.answer()
             return
         await show_confirmation(call.message, state)
@@ -493,10 +515,10 @@ async def receive_min_usd(message: Message, state: FSMContext) -> None:
     try:
         value = float(raw)
     except ValueError:
-        await message.answer('Send a valid number. Example: <code>10</code>', parse_mode=ParseMode.HTML)
+        await message.answer('Отправь корректное число. Пример: <code>10</code>', parse_mode=ParseMode.HTML)
         return
     if value < 0:
-        await message.answer('Minimum USD value cannot be negative.')
+        await message.answer('Минимальная сумма в USD не может быть отрицательной.')
         return
     await state.update_data(min_usd=value)
     await show_confirmation(message, state)
@@ -506,12 +528,12 @@ async def show_confirmation(target: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await state.set_state(CheckFlow.ready)
     await target.answer(
-        '<b>Ready to run</b>\n\n'
-        f'Addresses: <code>{len(data.get("addresses", []))}</code>\n'
-        f'Chains: <code>{", ".join(sorted(data.get("selected_chains", [])))}</code>\n'
-        f'Tokens: <code>{data.get("token_filter", "all")}</code>\n'
-        f'Result filter: <code>{data.get("result_filter", "all")}</code>\n'
-        f'Min USD: <code>{data.get("min_usd", 0)}</code>',
+        '<b>Готово к запуску</b>\n\n'
+        f'Адресов: <code>{len(data.get("addresses", []))}</code>\n'
+        f'Сети: <code>{", ".join(sorted(data.get("selected_chains", [])))}</code>\n'
+        f'Токены: <code>{label(TOKEN_LABELS, data.get("token_filter", "all"))}</code>\n'
+        f'Фильтр результата: <code>{label(FILTER_LABELS, data.get("result_filter", "all"))}</code>\n'
+        f'Минимум USD: <code>{data.get("min_usd", 0)}</code>',
         reply_markup=confirm_keyboard(),
         parse_mode=ParseMode.HTML,
     )
@@ -529,7 +551,7 @@ def anti_spam_ok(user_id: int, seconds: int = 5) -> bool:
 @dp.callback_query(F.data == 'check:run')
 async def cb_run_check(call: CallbackQuery, state: FSMContext) -> None:
     if not anti_spam_ok(call.from_user.id):
-        await call.answer('Wait a few seconds before starting another job.', show_alert=True)
+        await call.answer('Подожди несколько секунд перед запуском новой задачи.', show_alert=True)
         return
     data = await state.get_data()
     await start_job_from_data(call, state, data)
@@ -545,11 +567,11 @@ async def start_job_from_data(call: CallbackQuery, state: FSMContext, data: dict
     key = await dune_api_key()
     qid = await dune_query_id()
     if not addresses or not chains or not key or not qid:
-        await call.answer('Missing addresses, chains or API settings', show_alert=True)
+        await call.answer('Не хватает адресов, сетей или API-настроек', show_alert=True)
         return
     job_id = await storage.create_job(call.from_user.id, call.message.chat.id, addresses, invalid_addresses, chains, token_filter, result_filter, min_usd)
     await state.clear()
-    await call.message.edit_text(f'Job <b>#{job_id}</b> queued. Status: waiting -> running -> ready/error.', parse_mode=ParseMode.HTML)
+    await call.message.edit_text(f'Задача <b>#{job_id}</b> поставлена в очередь. Статус: ожидает -> выполняется -> готово/ошибка.', parse_mode=ParseMode.HTML)
     await call.answer()
     asyncio.create_task(run_job(call.from_user.id, call.message.chat.id, job_id, addresses, invalid_addresses, chains, token_filter, result_filter, min_usd, key, qid))
 
@@ -563,17 +585,17 @@ async def resume_pending_jobs() -> None:
         return
     if not key or not qid:
         for job in jobs:
-            await storage.update_job(job['id'], 'error', error='Missing Dune API settings after bot restart')
+            await storage.update_job(job['id'], 'error', error='После перезапуска бота нет Dune API настроек')
         log.warning('Marked %s resumable jobs as failed because Dune settings are missing', len(jobs))
         return
     for job in jobs:
         addresses = job.get('addresses_json') or []
         chains = sorted(set(str(job.get('chains') or '').split(',')) - {''})
         if not addresses or not chains:
-            await storage.update_job(job['id'], 'error', error='Job cannot be resumed: addresses or chains are missing')
+            await storage.update_job(job['id'], 'error', error='Задачу нельзя возобновить: нет адресов или сетей')
             continue
         chat_id = int(job.get('chat_id') or 0)
-        await bot.send_message(chat_id, f'Resuming job #{job["id"]} after restart.')
+        await bot.send_message(chat_id, f'Возобновляю задачу #{job["id"]} после перезапуска.')
         asyncio.create_task(run_job(
             int(job['user_id']),
             chat_id,
@@ -632,15 +654,15 @@ async def run_job(
             batches = split_batches(addresses, settings.dune_batch_size)
             total_batches = len(batches)
             await storage.update_job_progress(job_id, 0, total_batches)
-            progress_message = await bot.send_message(chat_id, f'Job #{job_id}: running batch 0/{total_batches}.')
+            progress_message = await bot.send_message(chat_id, f'Задача #{job_id}: выполняю батч 0/{total_batches}.')
             client = DuneClient(key, timeout_seconds=settings.dune_timeout_seconds, poll_seconds=settings.dune_poll_seconds)
             rows: list[dict] = []
             for index, batch in enumerate(batches, start=1):
                 await storage.update_job_progress(job_id, index - 1, total_batches)
                 try:
                     await progress_message.edit_text(
-                        f'Job #{job_id}: running batch {index}/{total_batches} '
-                        f'({len(batch)} addresses, {len(rows)} rows collected).'
+                        f'Задача #{job_id}: выполняю батч {index}/{total_batches} '
+                        f'({len(batch)} адресов, собрано строк: {len(rows)}).'
                     )
                 except Exception:
                     pass
@@ -650,34 +672,34 @@ async def run_job(
             result_path = make_excel(rows, addresses, invalid_addresses, RESULTS_DIR, job_id, result_filter, min_usd)
             await storage.update_job(job_id, 'done', result_file=str(result_path))
             try:
-                await progress_message.edit_text(f'Job #{job_id}: ready. Batches: {total_batches}/{total_batches}. Rows: {len(rows)}.')
+                await progress_message.edit_text(f'Задача #{job_id}: готово. Батчи: {total_batches}/{total_batches}. Строк: {len(rows)}.')
             except Exception:
                 pass
-            await bot.send_document(chat_id, FSInputFile(result_path), caption=f'Job #{job_id} ready. Result rows: {len(rows)}')
+            await bot.send_document(chat_id, FSInputFile(result_path), caption=f'Задача #{job_id} готова. Строк результата: {len(rows)}')
         except DuneError as e:
             await storage.update_job(job_id, 'error', error=str(e))
-            await bot.send_message(chat_id, f'Job #{job_id} failed with Dune error:\n<code>{str(e)[:1500]}</code>', parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id, f'Задача #{job_id} завершилась ошибкой Dune:\n<code>{str(e)[:1500]}</code>', parse_mode=ParseMode.HTML)
         except Exception as e:
             log.exception('Job %s failed for user %s', job_id, user_id)
             await storage.update_job(job_id, 'error', error=str(e))
-            await bot.send_message(chat_id, f'Job #{job_id} failed:\n<code>{str(e)[:1500]}</code>', parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id, f'Задача #{job_id} завершилась ошибкой:\n<code>{str(e)[:1500]}</code>', parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == 'jobs:history')
 async def cb_jobs_history(call: CallbackQuery) -> None:
     jobs = await storage.recent_jobs(call.from_user.id, 10)
     if not jobs:
-        await call.message.edit_text('History is empty.', reply_markup=main_menu(await is_configured()))
+        await call.message.edit_text('История пока пустая.', reply_markup=main_menu(await is_configured()))
         await call.answer()
         return
-    lines = ['<b>Recent jobs</b>\n']
+    lines = ['<b>Последние задачи</b>\n']
     for job in jobs:
-        err = f"\n   Error: <code>{str(job.get('error') or '')[:300]}</code>" if job.get('error') else ''
+        err = f"\n   Ошибка: <code>{str(job.get('error') or '')[:300]}</code>" if job.get('error') else ''
         lines.append(
-            f"#{job['id']} - <b>{job['status']}</b> - addresses: {job.get('address_count')} - "
-            f"chains: <code>{job.get('chains')}</code> - tokens: <code>{job.get('token_filter')}</code> - "
-            f"filter: <code>{job.get('result_filter')}</code> - "
-            f"progress: <code>{job.get('batch_done', 0)}/{job.get('batch_total', 0)}</code>{err}"
+            f"#{job['id']} - <b>{label(STATUS_LABELS, job.get('status'))}</b> - адресов: {job.get('address_count')} - "
+            f"сети: <code>{job.get('chains')}</code> - токены: <code>{label(TOKEN_LABELS, job.get('token_filter'))}</code> - "
+            f"фильтр: <code>{label(FILTER_LABELS, job.get('result_filter'))}</code> - "
+            f"прогресс: <code>{job.get('batch_done', 0)}/{job.get('batch_total', 0)}</code>{err}"
         )
     await call.message.edit_text('\n\n'.join(lines), reply_markup=jobs_keyboard(jobs), parse_mode=ParseMode.HTML)
     await call.answer()
@@ -688,25 +710,25 @@ async def cb_job_download(call: CallbackQuery) -> None:
     job_id = int(call.data.rsplit(':', 1)[1])
     job = await storage.get_job(call.from_user.id, job_id)
     if not job or not job.get('result_file'):
-        await call.answer('Result file is not available.', show_alert=True)
+        await call.answer('Файл результата недоступен.', show_alert=True)
         return
     path = Path(job['result_file'])
     if not path.exists():
-        await call.answer('Result file is missing on this server.', show_alert=True)
+        await call.answer('Файл результата отсутствует на этом сервере.', show_alert=True)
         return
-    await call.message.answer_document(FSInputFile(path), caption=f'Result for job #{job_id}')
+    await call.message.answer_document(FSInputFile(path), caption=f'Результат задачи #{job_id}')
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith('job:repeat:'))
 async def cb_job_repeat(call: CallbackQuery, state: FSMContext) -> None:
     if not anti_spam_ok(call.from_user.id):
-        await call.answer('Wait a few seconds before starting another job.', show_alert=True)
+        await call.answer('Подожди несколько секунд перед запуском новой задачи.', show_alert=True)
         return
     job_id = int(call.data.rsplit(':', 1)[1])
     job = await storage.get_job(call.from_user.id, job_id)
     if not job:
-        await call.answer('Job not found.', show_alert=True)
+        await call.answer('Задача не найдена.', show_alert=True)
         return
     data = {
         'addresses': job.get('addresses_json') or [],

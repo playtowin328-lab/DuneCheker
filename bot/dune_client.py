@@ -50,7 +50,7 @@ class DuneClient:
                     if state in {'QUERY_STATE_COMPLETED', 'QUERY_STATE_COMPLETED_PARTIAL'}:
                         return
                     if state in {'QUERY_STATE_FAILED', 'QUERY_STATE_CANCELED', 'QUERY_STATE_EXPIRED'}:
-                        raise DuneError(f'Dune execution {state}: {data.get("error") or data}')
+                        raise DuneError(f'Выполнение Dune завершилось состоянием {state}: {data.get("error") or data}')
                 if time.monotonic() - started > self.timeout_seconds:
                     raise DuneError('Таймаут Dune: запрос выполнялся слишком долго')
                 await asyncio.sleep(self.poll_seconds)
@@ -94,7 +94,7 @@ class DuneClient:
                 except Exception as exc:
                     status['details'] = str(exc)
             status['ok'] = True
-            status['details'] = 'API key accepted by configured endpoints status is unavailable'
+            status['details'] = 'API key принят, но подробный статус недоступен'
             return status
 
     async def run_wallet_check(self, query_id: int, addresses: list[str], chains: list[str], token_filter: str) -> list[dict[str, Any]]:

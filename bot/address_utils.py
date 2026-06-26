@@ -90,7 +90,7 @@ def extract_address_details_from_file(path: Path) -> AddressExtraction:
         return _extract_from_dataframe(pd.read_csv(path, dtype=str, keep_default_na=False, encoding_errors='ignore'))
     if suffix in {'.xlsx', '.xls'}:
         return _extract_from_dataframe(pd.read_excel(path, dtype=str).fillna(''))
-    raise ValueError('Supported file formats: TXT, CSV, XLSX')
+    raise ValueError('Поддерживаются только файлы TXT, CSV, XLSX')
 
 
 def extract_addresses_from_file(path: Path) -> list[str]:
