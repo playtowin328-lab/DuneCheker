@@ -43,7 +43,8 @@ bot = Bot(settings.bot_token)
 dp = Dispatcher()
 job_sem = asyncio.Semaphore(settings.job_concurrency)
 last_job_start: dict[int, float] = {}
-INSTANCE_ID = f'{int(time.time())}-{uuid.uuid4().hex}'
+INSTANCE_STARTED_AT = time.time()
+INSTANCE_ID = f'{int(INSTANCE_STARTED_AT)}-{uuid.uuid4().hex}'
 ACTIVE_INSTANCE_KEY = 'active_bot_instance_id'
 lost_leadership = asyncio.Event()
 
@@ -188,27 +189,60 @@ async def safe_edit_text(message: Message, text: str, **kwargs) -> None:
         raise
 
 
+def active_instance_payload() -> dict[str, object]:
+    now = time.time()
+    return {
+        'id': INSTANCE_ID,
+        'pid': os.getpid(),
+        'started_at': INSTANCE_STARTED_AT,
+        'heartbeat_at': now,
+    }
+
+
+def active_instance_label(value: object) -> str:
+    if isinstance(value, dict):
+        return str(value.get('id') or 'не задан')
+    return str(value or 'не задан')
+
+
+def is_newer_live_instance(value: object, max_age_seconds: int = 20) -> bool:
+    if not isinstance(value, dict):
+        return False
+    active_id = str(value.get('id') or '')
+    if not active_id or active_id == INSTANCE_ID:
+        return False
+    try:
+        active_started = float(value.get('started_at') or 0)
+        active_heartbeat = float(value.get('heartbeat_at') or 0)
+    except (TypeError, ValueError):
+        return False
+    if time.time() - active_heartbeat > max_age_seconds:
+        return False
+    if active_started > INSTANCE_STARTED_AT:
+        return True
+    return active_started == INSTANCE_STARTED_AT and active_id > INSTANCE_ID
+
+
 async def become_active_instance() -> None:
-    await storage.set(ACTIVE_INSTANCE_KEY, INSTANCE_ID)
-    await asyncio.sleep(2)
-    active = await storage.get(ACTIVE_INSTANCE_KEY)
-    if active != INSTANCE_ID:
-        raise RuntimeError('Этот экземпляр не стал активным: найден более новый запуск бота')
+    await storage.set(ACTIVE_INSTANCE_KEY, active_instance_payload())
     log.info('Active bot instance: %s pid=%s', INSTANCE_ID, os.getpid())
 
 
 async def active_instance_guard() -> None:
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
         active = await storage.get(ACTIVE_INSTANCE_KEY)
-        if active != INSTANCE_ID:
-            log.warning('Найден более новый экземпляр бота (%s). Останавливаю polling этого процесса %s.', active, INSTANCE_ID)
+        if is_newer_live_instance(active):
+            log.warning('Найден живой более новый экземпляр бота (%s). Останавливаю polling этого процесса %s.', active_instance_label(active), INSTANCE_ID)
             lost_leadership.set()
             try:
                 await dp.stop_polling()
             except RuntimeError:
                 pass
             return
+        if active_instance_label(active) != INSTANCE_ID:
+            log.warning('Активная запись устарела или принадлежит старому процессу (%s). Возвращаю лидерство процессу %s.', active_instance_label(active), INSTANCE_ID)
+        await storage.set(ACTIVE_INSTANCE_KEY, active_instance_payload())
 
 
 async def standby_forever() -> None:
@@ -222,7 +256,7 @@ async def admin_text(refresh_dune: bool = False) -> str:
     key = await dune_api_key()
     qid = await dune_query_id()
     ready, ready_text = await config_status()
-    active_instance = await storage.get(ACTIVE_INSTANCE_KEY, 'не задан')
+    active_instance = active_instance_label(await storage.get(ACTIVE_INSTANCE_KEY, 'не задан'))
     status = 'не настроен'
     credits = 'неизвестно'
     if key and refresh_dune:
@@ -847,13 +881,7 @@ async def errors_handler(event) -> bool:
 
 
 async def main() -> None:
-    try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    except RuntimeError as exc:
-        if 'не стал активным' in str(exc):
-            log.warning('%s', exc)
-            await standby_forever()
-        raise
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     if lost_leadership.is_set():
         await standby_forever()
 
