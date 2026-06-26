@@ -874,6 +874,24 @@ async def cb_job_repeat(call: CallbackQuery, state: FSMContext) -> None:
     await start_job_from_data(call, state, data)
 
 
+@dp.message(F.text)
+async def auto_save_query_id(message: Message) -> None:
+    if await deny_if_needed(message):
+        return
+    text = message.text or ''
+    if 'dune.com/queries/' not in text and not text.strip().isdigit():
+        return
+    value = parse_query_id(text)
+    if not value:
+        return
+    await storage.set('dune_query_id', value)
+    await message.answer(
+        f'Query ID сохранён: <code>{value}</code>\n\n' + await admin_text(refresh_dune=False),
+        reply_markup=settings_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @dp.errors()
 async def errors_handler(event) -> bool:
     log.exception('Unhandled update error: %s', event.exception)
