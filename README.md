@@ -12,8 +12,11 @@ The bot is designed for owner-only use: upload TXT/CSV/XLSX files, select chains
 - Deduplicate addresses and collect invalid `0x...`-like values.
 - Modes: native balances, stablecoins, all tokens.
 - Result filters: all wallets, only with balance, only above a USD amount.
-- Excel report with sheets: `All results`, `With balance`, `Empty`, `Invalid addresses`, `Summary`.
+- Excel report with sheets: `All results`, `With balance`, `By wallet`, `By chain`, `Top wallets`, `Empty`, `Invalid addresses`, `Summary`.
 - Job queue with statuses: `queued`, `running`, `done`, `error`.
+- Batched Dune execution for large lists.
+- Retry for temporary Dune errors.
+- Resume queued/running jobs after bot restart when database and chat ID are available.
 - History with repeat and download actions.
 - Owner access, key masking, key-message deletion attempt, address limit, anti-spam cooldown.
 - SQLite locally, PostgreSQL on Railway/VPS.
@@ -74,6 +77,9 @@ MAX_ADDRESSES_PER_JOB=3000
 DUNE_TIMEOUT_SECONDS=900
 DUNE_POLL_SECONDS=3
 JOB_CONCURRENCY=1
+DUNE_BATCH_SIZE=500
+DUNE_MAX_RETRIES=3
+DUNE_RETRY_DELAY_SECONDS=10
 ```
 
 5. Railway should provide `DATABASE_URL` from PostgreSQL. If it does not, link it manually from PostgreSQL variables.

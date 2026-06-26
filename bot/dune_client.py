@@ -8,6 +8,10 @@ class DuneError(RuntimeError):
     pass
 
 
+class DuneTransientError(DuneError):
+    pass
+
+
 class DuneClient:
     def __init__(self, api_key: str, timeout_seconds: int = 900, poll_seconds: int = 3):
         self.api_key = api_key
@@ -25,7 +29,8 @@ class DuneClient:
             async with session.post(url, headers=self.headers, json={'query_parameters': parameters}) as resp:
                 data = await resp.json(content_type=None)
                 if resp.status >= 400:
-                    raise DuneError(f'Ошибка Execute Query {resp.status}: {data}')
+                    error_cls = DuneTransientError if resp.status in {408, 409, 425, 429, 500, 502, 503, 504} else DuneError
+                    raise error_cls(f'Ошибка Execute Query {resp.status}: {data}')
                 execution_id = data.get('execution_id')
                 if not execution_id:
                     raise DuneError(f'Dune не вернул execution_id: {data}')
@@ -39,7 +44,8 @@ class DuneClient:
                 async with session.get(url, headers=self.headers) as resp:
                     data = await resp.json(content_type=None)
                     if resp.status >= 400:
-                        raise DuneError(f'Ошибка статуса Dune {resp.status}: {data}')
+                        error_cls = DuneTransientError if resp.status in {408, 409, 425, 429, 500, 502, 503, 504} else DuneError
+                        raise error_cls(f'Ошибка статуса Dune {resp.status}: {data}')
                     state = data.get('state')
                     if state in {'QUERY_STATE_COMPLETED', 'QUERY_STATE_COMPLETED_PARTIAL'}:
                         return
@@ -58,7 +64,8 @@ class DuneClient:
                 async with session.get(url, headers=self.headers) as resp:
                     data = await resp.json(content_type=None)
                     if resp.status >= 400:
-                        raise DuneError(f'Ошибка получения результатов {resp.status}: {data}')
+                        error_cls = DuneTransientError if resp.status in {408, 409, 425, 429, 500, 502, 503, 504} else DuneError
+                        raise error_cls(f'Ошибка получения результатов {resp.status}: {data}')
                     batch = data.get('result', {}).get('rows', [])
                     rows.extend(batch)
                     if len(batch) < limit:

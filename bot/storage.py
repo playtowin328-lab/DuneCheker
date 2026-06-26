@@ -30,6 +30,7 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS jobs (
                     id BIGSERIAL PRIMARY KEY,
                     user_id BIGINT NOT NULL,
+                    chat_id BIGINT DEFAULT 0,
                     status TEXT NOT NULL,
                     address_count INTEGER DEFAULT 0,
                     chains TEXT DEFAULT '',
@@ -38,6 +39,8 @@ class Storage:
                     min_usd DOUBLE PRECISION DEFAULT 0,
                     addresses_json JSONB DEFAULT '[]'::jsonb,
                     invalid_json JSONB DEFAULT '[]'::jsonb,
+                    batch_done INTEGER DEFAULT 0,
+                    batch_total INTEGER DEFAULT 0,
                     result_file TEXT DEFAULT '',
                     error TEXT DEFAULT '',
                     created_at TIMESTAMPTZ DEFAULT now(),
@@ -54,6 +57,7 @@ class Storage:
             CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
+                chat_id INTEGER DEFAULT 0,
                 status TEXT NOT NULL,
                 address_count INTEGER DEFAULT 0,
                 chains TEXT DEFAULT '',
@@ -62,6 +66,8 @@ class Storage:
                 min_usd REAL DEFAULT 0,
                 addresses_json TEXT DEFAULT '[]',
                 invalid_json TEXT DEFAULT '[]',
+                batch_done INTEGER DEFAULT 0,
+                batch_total INTEGER DEFAULT 0,
                 result_file TEXT DEFAULT '',
                 error TEXT DEFAULT '',
                 created_at INTEGER NOT NULL,
@@ -77,6 +83,9 @@ class Storage:
             "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS min_usd DOUBLE PRECISION DEFAULT 0",
             "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS addresses_json JSONB DEFAULT '[]'::jsonb",
             "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS invalid_json JSONB DEFAULT '[]'::jsonb",
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS chat_id BIGINT DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS batch_done INTEGER DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS batch_total INTEGER DEFAULT 0",
         ]
         for query in migrations:
             await self._pg_execute(query)
@@ -91,6 +100,9 @@ class Storage:
             'min_usd': 'ALTER TABLE jobs ADD COLUMN min_usd REAL DEFAULT 0',
             'addresses_json': "ALTER TABLE jobs ADD COLUMN addresses_json TEXT DEFAULT '[]'",
             'invalid_json': "ALTER TABLE jobs ADD COLUMN invalid_json TEXT DEFAULT '[]'",
+            'chat_id': 'ALTER TABLE jobs ADD COLUMN chat_id INTEGER DEFAULT 0',
+            'batch_done': 'ALTER TABLE jobs ADD COLUMN batch_done INTEGER DEFAULT 0',
+            'batch_total': 'ALTER TABLE jobs ADD COLUMN batch_total INTEGER DEFAULT 0',
         }
         for column, query in migrations.items():
             if column not in existing:
@@ -144,6 +156,7 @@ class Storage:
     async def create_job(
         self,
         user_id: int,
+        chat_id: int,
         addresses: list[str],
         invalid_addresses: list[str],
         chains: list[str],
@@ -156,16 +169,16 @@ class Storage:
         if self.pg_pool:
             async with self.pg_pool.acquire() as conn:
                 row = await conn.fetchrow('''
-                    INSERT INTO jobs(user_id,status,address_count,chains,token_filter,result_filter,min_usd,addresses_json,invalid_json)
-                    VALUES($1,'queued',$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb) RETURNING id
-                ''', user_id, len(addresses), ','.join(chains), token_filter, result_filter, min_usd, addresses_json, invalid_json)
+                    INSERT INTO jobs(user_id,chat_id,status,address_count,chains,token_filter,result_filter,min_usd,addresses_json,invalid_json)
+                    VALUES($1,$2,'queued',$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb) RETURNING id
+                ''', user_id, chat_id, len(addresses), ','.join(chains), token_filter, result_filter, min_usd, addresses_json, invalid_json)
                 return int(row['id'])
         assert self.sqlite
         now = int(time.time())
         cur = await self.sqlite.execute('''
-            INSERT INTO jobs(user_id,status,address_count,chains,token_filter,result_filter,min_usd,addresses_json,invalid_json,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
-        ''', (user_id, 'queued', len(addresses), ','.join(chains), token_filter, result_filter, min_usd, addresses_json, invalid_json, now, now))
+            INSERT INTO jobs(user_id,chat_id,status,address_count,chains,token_filter,result_filter,min_usd,addresses_json,invalid_json,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        ''', (user_id, chat_id, 'queued', len(addresses), ','.join(chains), token_filter, result_filter, min_usd, addresses_json, invalid_json, now, now))
         await self.sqlite.commit()
         return int(cur.lastrowid)
 
@@ -181,6 +194,44 @@ class Storage:
         else:
             await self.sqlite.execute('UPDATE jobs SET status=?,error=?,updated_at=? WHERE id=?', (status, error[:2000], now, job_id))
         await self.sqlite.commit()
+
+    async def update_job_progress(self, job_id: int, batch_done: int, batch_total: int, status: str = 'running') -> None:
+        if self.pg_pool:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute(
+                    'UPDATE jobs SET status=$1,batch_done=$2,batch_total=$3,updated_at=now() WHERE id=$4',
+                    status,
+                    batch_done,
+                    batch_total,
+                    job_id,
+                )
+            return
+        assert self.sqlite
+        now = int(time.time())
+        await self.sqlite.execute(
+            'UPDATE jobs SET status=?,batch_done=?,batch_total=?,updated_at=? WHERE id=?',
+            (status, batch_done, batch_total, now, job_id),
+        )
+        await self.sqlite.commit()
+
+    async def resumable_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        statuses = ('queued', 'running')
+        if self.pg_pool:
+            async with self.pg_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    'SELECT * FROM jobs WHERE status = ANY($1::text[]) AND chat_id <> 0 ORDER BY id ASC LIMIT $2',
+                    list(statuses),
+                    limit,
+                )
+                return [self._decode_job(dict(r)) for r in rows]
+        assert self.sqlite
+        async with self.sqlite.execute(
+            'SELECT * FROM jobs WHERE status IN (?,?) AND chat_id <> 0 ORDER BY id ASC LIMIT ?',
+            (*statuses, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+            return [self._decode_job(dict(zip(cols, r))) for r in rows]
 
     async def get_job(self, user_id: int, job_id: int) -> dict[str, Any] | None:
         if self.pg_pool:

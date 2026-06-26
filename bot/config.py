@@ -32,6 +32,9 @@ class Settings:
     dune_timeout_seconds: int
     dune_poll_seconds: int
     job_concurrency: int
+    dune_batch_size: int
+    dune_max_retries: int
+    dune_retry_delay_seconds: int
 
 
 def load_settings() -> Settings:
@@ -50,4 +53,7 @@ def load_settings() -> Settings:
         dune_timeout_seconds=int(os.getenv('DUNE_TIMEOUT_SECONDS', '900')),
         dune_poll_seconds=int(os.getenv('DUNE_POLL_SECONDS', '3')),
         job_concurrency=max(1, int(os.getenv('JOB_CONCURRENCY', '1'))),
+        dune_batch_size=max(1, int(os.getenv('DUNE_BATCH_SIZE', '500'))),
+        dune_max_retries=max(1, int(os.getenv('DUNE_MAX_RETRIES', '3'))),
+        dune_retry_delay_seconds=max(1, int(os.getenv('DUNE_RETRY_DELAY_SECONDS', '10'))),
     )

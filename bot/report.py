@@ -29,6 +29,45 @@ def _filtered_balance_rows(df: pd.DataFrame, result_filter: str, min_usd: float)
     return filtered.sort_values('balance_usd', ascending=False, na_position='last')
 
 
+def _by_wallet(df: pd.DataFrame, requested_addresses: list[str]) -> pd.DataFrame:
+    base = pd.DataFrame({'address': [address.lower() for address in requested_addresses]})
+    if df.empty:
+        base['total_usd'] = 0.0
+        base['token_rows'] = 0
+        base['chains'] = ''
+        base['top_token'] = ''
+        return base
+
+    work = df.copy()
+    work['balance_usd'] = work['balance_usd'].fillna(0)
+    grouped = work.groupby('address', as_index=False).agg(
+        total_usd=('balance_usd', 'sum'),
+        token_rows=('token_symbol', 'count'),
+        chains=('blockchain', lambda values: ','.join(sorted({str(v) for v in values if str(v)}))),
+    )
+    top_rows = work.sort_values('balance_usd', ascending=False).drop_duplicates('address')
+    top_rows = top_rows[['address', 'token_symbol']].rename(columns={'token_symbol': 'top_token'})
+    grouped = grouped.merge(top_rows, on='address', how='left')
+    result = base.merge(grouped, on='address', how='left')
+    result['total_usd'] = result['total_usd'].fillna(0)
+    result['token_rows'] = result['token_rows'].fillna(0).astype(int)
+    result['chains'] = result['chains'].fillna('')
+    result['top_token'] = result['top_token'].fillna('')
+    return result.sort_values('total_usd', ascending=False, na_position='last')
+
+
+def _by_chain(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=['blockchain', 'total_usd', 'wallets', 'token_rows'])
+    work = df.copy()
+    work['balance_usd'] = work['balance_usd'].fillna(0)
+    return work.groupby('blockchain', as_index=False).agg(
+        total_usd=('balance_usd', 'sum'),
+        wallets=('address', 'nunique'),
+        token_rows=('token_symbol', 'count'),
+    ).sort_values('total_usd', ascending=False)
+
+
 def make_excel(
     rows: list[dict],
     requested_addresses: list[str],
@@ -44,6 +83,9 @@ def make_excel(
 
     df = _prepare_rows(rows)
     with_balance = _filtered_balance_rows(df, result_filter, min_usd)
+    by_wallet = _by_wallet(df, requested_addresses)
+    by_chain = _by_chain(df)
+    top_wallets = by_wallet[by_wallet['total_usd'].fillna(0) > 0].head(100).copy()
     positive_addresses = set(df.loc[df['balance'].fillna(0) > 0, 'address'].str.lower()) if not df.empty else set()
     empty_addresses = [a for a in requested_addresses if a.lower() not in positive_addresses]
 
@@ -55,6 +97,8 @@ def make_excel(
         'invalid_addresses': len(invalid_addresses),
         'rows_all_results': len(df),
         'rows_with_balance_sheet': len(with_balance),
+        'wallet_rows': len(by_wallet),
+        'top_wallets': len(top_wallets),
         'result_filter': result_filter,
         'min_usd': min_usd,
         'total_usd_all_results': float(df['balance_usd'].fillna(0).sum()) if not df.empty else 0.0,
@@ -65,6 +109,9 @@ def make_excel(
     with pd.ExcelWriter(path, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='All results')
         with_balance.to_excel(writer, index=False, sheet_name='With balance')
+        by_wallet.to_excel(writer, index=False, sheet_name='By wallet')
+        by_chain.to_excel(writer, index=False, sheet_name='By chain')
+        top_wallets.to_excel(writer, index=False, sheet_name='Top wallets')
         pd.DataFrame({'address': empty_addresses}).to_excel(writer, index=False, sheet_name='Empty')
         pd.DataFrame({'address': invalid_addresses}).to_excel(writer, index=False, sheet_name='Invalid addresses')
         summary.to_excel(writer, index=False, sheet_name='Summary')

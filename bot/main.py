@@ -11,9 +11,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
-from .address_utils import extract_address_details_from_file, extract_addresses
+from .address_utils import extract_address_details_from_file, extract_addresses, split_batches
 from .config import RESULTS_DIR, load_settings
-from .dune_client import DuneClient, DuneError
+from .dune_client import DuneClient, DuneError, DuneTransientError
 from .keyboards import (
     CHAINS,
     admin_keyboard,
@@ -142,7 +142,9 @@ async def admin_text(refresh_dune: bool = False) -> str:
         f'Storage: <code>{storage.backend}</code>\n'
         f'Dune API key: <code>{mask_secret(key)}</code>\n'
         f'Address limit: <code>{await max_limit()}</code>\n'
-        f'Job concurrency: <code>{settings.job_concurrency}</code>'
+        f'Job concurrency: <code>{settings.job_concurrency}</code>\n'
+        f'Batch size: <code>{settings.dune_batch_size}</code>\n'
+        f'Retries per batch: <code>{settings.dune_max_retries}</code>'
     )
 
 
@@ -156,6 +158,7 @@ async def on_startup() -> None:
     if settings.dune_query_id and not await storage.get('dune_query_id'):
         await storage.set('dune_query_id', settings.dune_query_id)
     log.info('Bot started. Storage backend: %s', storage.backend)
+    asyncio.create_task(resume_pending_jobs())
 
 
 @dp.shutdown()
@@ -544,11 +547,71 @@ async def start_job_from_data(call: CallbackQuery, state: FSMContext, data: dict
     if not addresses or not chains or not key or not qid:
         await call.answer('Missing addresses, chains or API settings', show_alert=True)
         return
-    job_id = await storage.create_job(call.from_user.id, addresses, invalid_addresses, chains, token_filter, result_filter, min_usd)
+    job_id = await storage.create_job(call.from_user.id, call.message.chat.id, addresses, invalid_addresses, chains, token_filter, result_filter, min_usd)
     await state.clear()
     await call.message.edit_text(f'Job <b>#{job_id}</b> queued. Status: waiting -> running -> ready/error.', parse_mode=ParseMode.HTML)
     await call.answer()
     asyncio.create_task(run_job(call.from_user.id, call.message.chat.id, job_id, addresses, invalid_addresses, chains, token_filter, result_filter, min_usd, key, qid))
+
+
+async def resume_pending_jobs() -> None:
+    await asyncio.sleep(2)
+    key = await dune_api_key()
+    qid = await dune_query_id()
+    jobs = await storage.resumable_jobs()
+    if not jobs:
+        return
+    if not key or not qid:
+        for job in jobs:
+            await storage.update_job(job['id'], 'error', error='Missing Dune API settings after bot restart')
+        log.warning('Marked %s resumable jobs as failed because Dune settings are missing', len(jobs))
+        return
+    for job in jobs:
+        addresses = job.get('addresses_json') or []
+        chains = sorted(set(str(job.get('chains') or '').split(',')) - {''})
+        if not addresses or not chains:
+            await storage.update_job(job['id'], 'error', error='Job cannot be resumed: addresses or chains are missing')
+            continue
+        chat_id = int(job.get('chat_id') or 0)
+        await bot.send_message(chat_id, f'Resuming job #{job["id"]} after restart.')
+        asyncio.create_task(run_job(
+            int(job['user_id']),
+            chat_id,
+            int(job['id']),
+            addresses,
+            job.get('invalid_json') or [],
+            chains,
+            job.get('token_filter') or 'all',
+            job.get('result_filter') or 'all',
+            float(job.get('min_usd') or 0),
+            key,
+            qid,
+        ))
+
+
+async def run_dune_batch_with_retry(
+    client: DuneClient,
+    qid: int,
+    batch: list[str],
+    chains: list[str],
+    token_filter: str,
+    job_id: int,
+    batch_number: int,
+) -> list[dict]:
+    last_error: Exception | None = None
+    for attempt in range(1, settings.dune_max_retries + 1):
+        try:
+            return await client.run_wallet_check(qid, batch, chains, token_filter)
+        except DuneTransientError as exc:
+            last_error = exc
+            if attempt >= settings.dune_max_retries:
+                break
+            delay = settings.dune_retry_delay_seconds * attempt
+            log.warning('Job %s batch %s transient Dune error on attempt %s/%s: %s', job_id, batch_number, attempt, settings.dune_max_retries, exc)
+            await asyncio.sleep(delay)
+    if last_error:
+        raise last_error
+    return []
 
 
 async def run_job(
@@ -566,12 +629,30 @@ async def run_job(
 ) -> None:
     async with job_sem:
         try:
-            await storage.update_job(job_id, 'running')
-            await bot.send_message(chat_id, f'Job #{job_id}: request sent to Dune. Large lists can take a while.')
+            batches = split_batches(addresses, settings.dune_batch_size)
+            total_batches = len(batches)
+            await storage.update_job_progress(job_id, 0, total_batches)
+            progress_message = await bot.send_message(chat_id, f'Job #{job_id}: running batch 0/{total_batches}.')
             client = DuneClient(key, timeout_seconds=settings.dune_timeout_seconds, poll_seconds=settings.dune_poll_seconds)
-            rows = await client.run_wallet_check(qid, addresses, chains, token_filter)
+            rows: list[dict] = []
+            for index, batch in enumerate(batches, start=1):
+                await storage.update_job_progress(job_id, index - 1, total_batches)
+                try:
+                    await progress_message.edit_text(
+                        f'Job #{job_id}: running batch {index}/{total_batches} '
+                        f'({len(batch)} addresses, {len(rows)} rows collected).'
+                    )
+                except Exception:
+                    pass
+                rows.extend(await run_dune_batch_with_retry(client, qid, batch, chains, token_filter, job_id, index))
+                await storage.update_job_progress(job_id, index, total_batches)
+
             result_path = make_excel(rows, addresses, invalid_addresses, RESULTS_DIR, job_id, result_filter, min_usd)
             await storage.update_job(job_id, 'done', result_file=str(result_path))
+            try:
+                await progress_message.edit_text(f'Job #{job_id}: ready. Batches: {total_batches}/{total_batches}. Rows: {len(rows)}.')
+            except Exception:
+                pass
             await bot.send_document(chat_id, FSInputFile(result_path), caption=f'Job #{job_id} ready. Result rows: {len(rows)}')
         except DuneError as e:
             await storage.update_job(job_id, 'error', error=str(e))
@@ -595,7 +676,8 @@ async def cb_jobs_history(call: CallbackQuery) -> None:
         lines.append(
             f"#{job['id']} - <b>{job['status']}</b> - addresses: {job.get('address_count')} - "
             f"chains: <code>{job.get('chains')}</code> - tokens: <code>{job.get('token_filter')}</code> - "
-            f"filter: <code>{job.get('result_filter')}</code>{err}"
+            f"filter: <code>{job.get('result_filter')}</code> - "
+            f"progress: <code>{job.get('batch_done', 0)}/{job.get('batch_total', 0)}</code>{err}"
         )
     await call.message.edit_text('\n\n'.join(lines), reply_markup=jobs_keyboard(jobs), parse_mode=ParseMode.HTML)
     await call.answer()
