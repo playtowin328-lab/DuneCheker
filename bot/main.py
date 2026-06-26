@@ -10,7 +10,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
@@ -322,9 +322,38 @@ async def cmd_help(message: Message) -> None:
         '<b>Команды</b>\n\n'
         '/start - меню\n'
         '/help - помощь\n\n'
+        '/qid 7819106 - сохранить Dune Query ID\n\n'
         'Сценарий: админ-панель -> Dune API key -> Query ID -> загрузка адресов -> сети -> режим -> Excel.',
         parse_mode=ParseMode.HTML,
     )
+
+
+async def save_query_id_from_text(message: Message, state: FSMContext | None = None) -> bool:
+    if await deny_if_needed(message):
+        return True
+    value = parse_query_id(message.text or '')
+    if not value:
+        await message.answer('Не смог найти Query ID. Отправь так: <code>/qid 7819106</code>', parse_mode=ParseMode.HTML)
+        return False
+    await storage.set('dune_query_id', value)
+    if state:
+        await state.clear()
+    await message.answer(
+        f'Query ID сохранён: <code>{value}</code>\n\n' + await admin_text(refresh_dune=False),
+        reply_markup=settings_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+    return True
+
+
+@dp.message(Command('qid'))
+async def cmd_qid(message: Message, state: FSMContext) -> None:
+    await save_query_id_from_text(message, state)
+
+
+@dp.message(StateFilter(None), F.text.regexp(r'(dune\.com/queries/|\b\d{4,}\b)'))
+async def auto_save_query_id_idle(message: Message) -> None:
+    await save_query_id_from_text(message)
 
 
 @dp.message(Command('status'))
@@ -872,24 +901,6 @@ async def cb_job_repeat(call: CallbackQuery, state: FSMContext) -> None:
         'min_usd': float(job.get('min_usd') or 0),
     }
     await start_job_from_data(call, state, data)
-
-
-@dp.message(F.text)
-async def auto_save_query_id(message: Message) -> None:
-    if await deny_if_needed(message):
-        return
-    text = message.text or ''
-    if 'dune.com/queries/' not in text and not text.strip().isdigit():
-        return
-    value = parse_query_id(text)
-    if not value:
-        return
-    await storage.set('dune_query_id', value)
-    await message.answer(
-        f'Query ID сохранён: <code>{value}</code>\n\n' + await admin_text(refresh_dune=False),
-        reply_markup=settings_keyboard(),
-        parse_mode=ParseMode.HTML,
-    )
 
 
 @dp.errors()
