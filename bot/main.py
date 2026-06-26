@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import re
 import tempfile
 import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -56,6 +58,7 @@ FILTER_LABELS = {
     'positive': 'только с балансом',
     'min_usd': 'выше суммы в USD',
 }
+QUERY_ID_RE = re.compile(r'(\d{4,})')
 
 
 class CheckFlow(StatesGroup):
@@ -130,6 +133,19 @@ async def is_configured() -> bool:
     return bool(await dune_api_key() and await dune_query_id())
 
 
+async def config_status() -> tuple[bool, str]:
+    has_key = bool(await dune_api_key())
+    has_qid = bool(await dune_query_id())
+    if has_key and has_qid:
+        return True, 'готово'
+    missing = []
+    if not has_key:
+        missing.append('Dune API key')
+    if not has_qid:
+        missing.append('Query ID')
+    return False, 'не хватает: ' + ', '.join(missing)
+
+
 def mask_secret(value: str) -> str:
     if not value:
         return 'не задан'
@@ -143,10 +159,35 @@ def label(mapping: dict[str, str], value: object) -> str:
     return mapping.get(raw, raw or 'не задано')
 
 
+def parse_dune_key(text: str) -> str:
+    value = (text or '').strip()
+    if '=' in value:
+        value = value.split('=', 1)[1].strip()
+    return value.strip(' "\'`')
+
+
+def parse_query_id(text: str) -> str:
+    value = (text or '').strip()
+    if value.isdigit():
+        return value
+    match = QUERY_ID_RE.search(value)
+    return match.group(1) if match else ''
+
+
+async def safe_edit_text(message: Message, text: str, **kwargs) -> None:
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as exc:
+        if 'message is not modified' in str(exc):
+            return
+        raise
+
+
 async def admin_text(refresh_dune: bool = False) -> str:
     owner = await get_owner_id()
     key = await dune_api_key()
     qid = await dune_query_id()
+    ready, ready_text = await config_status()
     status = 'не настроен'
     credits = 'неизвестно'
     if key and refresh_dune:
@@ -157,6 +198,7 @@ async def admin_text(refresh_dune: bool = False) -> str:
         status = 'настроен'
     return (
         '<b>Админ-панель</b>\n\n'
+        f'Готовность: <code>{ready_text}</code>\n'
         f'Статус Dune API: <code>{status}</code>\n'
         f'Credits / лимиты: <code>{credits}</code>\n'
         f'Текущий Query ID: <code>{qid or "не задан"}</code>\n'
@@ -213,6 +255,13 @@ async def cmd_help(message: Message) -> None:
     )
 
 
+@dp.message(Command('status'))
+async def cmd_status(message: Message) -> None:
+    if await deny_if_needed(message):
+        return
+    await message.answer(await admin_text(refresh_dune=False), reply_markup=admin_keyboard(), parse_mode=ParseMode.HTML)
+
+
 @dp.callback_query(F.data == 'menu')
 async def menu(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -225,7 +274,7 @@ async def cb_admin(call: CallbackQuery, state: FSMContext) -> None:
     if await deny_if_needed(call):
         return
     await state.clear()
-    await call.message.edit_text(await admin_text(refresh_dune=True), reply_markup=admin_keyboard(), parse_mode=ParseMode.HTML)
+    await safe_edit_text(call.message, await admin_text(refresh_dune=True), reply_markup=admin_keyboard(), parse_mode=ParseMode.HTML)
     await call.answer()
 
 
@@ -270,8 +319,8 @@ async def cb_set_dune_key(call: CallbackQuery, state: FSMContext) -> None:
 async def receive_dune_key(message: Message, state: FSMContext) -> None:
     if await deny_if_needed(message):
         return
-    key = (message.text or '').strip()
-    if len(key) < 20:
+    key = parse_dune_key(message.text or '')
+    if len(key) < 12:
         await message.answer('Ключ выглядит слишком коротким. Проверь его и отправь ещё раз.')
         return
     await storage.set('dune_api_key', key)
@@ -280,13 +329,21 @@ async def receive_dune_key(message: Message, state: FSMContext) -> None:
         await message.delete()
     except Exception:
         pass
-    await message.answer('Dune API key сохранён. В интерфейсе он будет показываться только маской.', reply_markup=settings_keyboard())
+    await message.answer(
+        'Dune API key сохранён. В интерфейсе он будет показываться только маской.\n\n' + await admin_text(refresh_dune=False),
+        reply_markup=settings_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @dp.callback_query(F.data == 'set:query_id')
 async def cb_set_query_id(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SettingsFlow.waiting_query_id)
-    await call.message.edit_text('Отправь Dune Query ID числом. Пример: <code>1234567</code>', reply_markup=back_keyboard(), parse_mode=ParseMode.HTML)
+    await call.message.edit_text(
+        'Отправь Dune Query ID числом или ссылкой на query. Пример: <code>1234567</code> или <code>https://dune.com/queries/1234567/...</code>',
+        reply_markup=back_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
     await call.answer()
 
 
@@ -294,13 +351,17 @@ async def cb_set_query_id(call: CallbackQuery, state: FSMContext) -> None:
 async def receive_query_id(message: Message, state: FSMContext) -> None:
     if await deny_if_needed(message):
         return
-    value = (message.text or '').strip()
-    if not value.isdigit():
-        await message.answer('Query ID должен быть числом.')
+    value = parse_query_id(message.text or '')
+    if not value:
+        await message.answer('Не смог найти Query ID. Отправь число из ссылки Dune, например: <code>1234567</code>.', parse_mode=ParseMode.HTML)
         return
     await storage.set('dune_query_id', value)
     await state.clear()
-    await message.answer(f'Query ID сохранён: <code>{value}</code>', reply_markup=settings_keyboard(), parse_mode=ParseMode.HTML)
+    await message.answer(
+        f'Query ID сохранён: <code>{value}</code>\n\n' + await admin_text(refresh_dune=False),
+        reply_markup=settings_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @dp.callback_query(F.data == 'set:max_limit')
