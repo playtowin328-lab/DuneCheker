@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import os
 import re
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -41,6 +43,9 @@ bot = Bot(settings.bot_token)
 dp = Dispatcher()
 job_sem = asyncio.Semaphore(settings.job_concurrency)
 last_job_start: dict[int, float] = {}
+INSTANCE_ID = f'{int(time.time())}-{uuid.uuid4().hex}'
+ACTIVE_INSTANCE_KEY = 'active_bot_instance_id'
+lost_leadership = asyncio.Event()
 
 STATUS_LABELS = {
     'queued': 'ожидает',
@@ -183,11 +188,41 @@ async def safe_edit_text(message: Message, text: str, **kwargs) -> None:
         raise
 
 
+async def become_active_instance() -> None:
+    await storage.set(ACTIVE_INSTANCE_KEY, INSTANCE_ID)
+    await asyncio.sleep(2)
+    active = await storage.get(ACTIVE_INSTANCE_KEY)
+    if active != INSTANCE_ID:
+        raise RuntimeError('Этот экземпляр не стал активным: найден более новый запуск бота')
+    log.info('Active bot instance: %s pid=%s', INSTANCE_ID, os.getpid())
+
+
+async def active_instance_guard() -> None:
+    while True:
+        await asyncio.sleep(5)
+        active = await storage.get(ACTIVE_INSTANCE_KEY)
+        if active != INSTANCE_ID:
+            log.warning('Найден более новый экземпляр бота (%s). Останавливаю polling этого процесса %s.', active, INSTANCE_ID)
+            lost_leadership.set()
+            try:
+                await dp.stop_polling()
+            except RuntimeError:
+                pass
+            return
+
+
+async def standby_forever() -> None:
+    log.warning('Процесс %s перешёл в standby и не слушает Telegram updates.', INSTANCE_ID)
+    while True:
+        await asyncio.sleep(3600)
+
+
 async def admin_text(refresh_dune: bool = False) -> str:
     owner = await get_owner_id()
     key = await dune_api_key()
     qid = await dune_query_id()
     ready, ready_text = await config_status()
+    active_instance = await storage.get(ACTIVE_INSTANCE_KEY, 'не задан')
     status = 'не настроен'
     credits = 'неизвестно'
     if key and refresh_dune:
@@ -204,6 +239,7 @@ async def admin_text(refresh_dune: bool = False) -> str:
         f'Текущий Query ID: <code>{qid or "не задан"}</code>\n'
         f'Владелец бота: <code>{owner or "не задан"}</code>\n'
         f'Хранилище: <code>{storage.backend}</code>\n'
+        f'Активный процесс: <code>{active_instance}</code>\n'
         f'Dune API key: <code>{mask_secret(key)}</code>\n'
         f'Лимит адресов: <code>{await max_limit()}</code>\n'
         f'Параллельных задач: <code>{settings.job_concurrency}</code>\n'
@@ -215,6 +251,7 @@ async def admin_text(refresh_dune: bool = False) -> str:
 @dp.startup()
 async def on_startup() -> None:
     await storage.connect()
+    await become_active_instance()
     if settings.owner_user_id:
         await storage.set('owner_user_id', settings.owner_user_id)
     if settings.dune_api_key and not await storage.get('dune_api_key'):
@@ -222,6 +259,7 @@ async def on_startup() -> None:
     if settings.dune_query_id and not await storage.get('dune_query_id'):
         await storage.set('dune_query_id', settings.dune_query_id)
     log.info('Bot started. Storage backend: %s', storage.backend)
+    asyncio.create_task(active_instance_guard())
     asyncio.create_task(resume_pending_jobs())
 
 
@@ -809,7 +847,15 @@ async def errors_handler(event) -> bool:
 
 
 async def main() -> None:
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except RuntimeError as exc:
+        if 'не стал активным' in str(exc):
+            log.warning('%s', exc)
+            await standby_forever()
+        raise
+    if lost_leadership.is_set():
+        await standby_forever()
 
 
 if __name__ == '__main__':
